@@ -394,6 +394,155 @@ def perform_search(query: str, limit: Optional[int], cursor: Optional[str]) -> t
     return results, next_cursor, metadata
 
 
+def _search_result_to_payload(item: SearchResultItem) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        'id': item.id,
+        'title': item.title,
+        'text': item.content,
+        'metadata': item.metadata or {},
+    }
+    if item.score is not None:
+        payload['score'] = item.score
+    return payload
+
+
+@mcp.tool(
+    name='search',
+    description='Search StarRocks tables and columns using keywords.',
+    tags={'search'},
+    annotations={'mcp:action': 'search'},
+)
+def search_metadata(
+    query: Annotated[str, Field(description='Keyword or phrase to search for in StarRocks metadata.')],
+    limit: Annotated[Optional[int], Field(description='Maximum number of results to return.', ge=1, le=MAX_SEARCH_LIMIT)] = None,
+    cursor: Annotated[Optional[str], Field(description='Opaque cursor from a previous search call.')] = None,
+) -> ToolResult:
+    """Expose perform_search as a structured MCP tool response."""
+
+    results, next_cursor, metadata = perform_search(query, limit, cursor)
+    payload_results = [_search_result_to_payload(item) for item in results]
+
+    structured: Dict[str, Any] = {
+        'results': payload_results,
+        'meta': metadata,
+    }
+    if next_cursor:
+        structured['nextCursor'] = next_cursor
+        structured['next_cursor'] = next_cursor
+
+    summary_lines = [f"Found {len(payload_results)} results for '{metadata['query']}'."]
+    for entry in payload_results[:5]:
+        summary_lines.append(f"- {entry['title']}")
+    if next_cursor:
+        summary_lines.append('More results available via nextCursor.')
+
+    return ToolResult(
+        content=[TextContent(type='text', text='\n'.join(summary_lines))],
+        structured_content=structured,
+    )
+
+
+def _build_column_detail(row: List[Any]) -> tuple[str, Dict[str, Any]]:
+    schema, table, column, data_type, comment, ordinal, is_nullable, default_value = row
+    lines = [
+        f'Database: {schema}',
+        f'Table: {table}',
+        f'Column: {column}',
+        f'Type: {data_type}',
+        f'Nullable: {is_nullable}',
+    ]
+    if default_value not in (None, ''):
+        lines.append(f'Default: {default_value}')
+    if comment:
+        lines.append(f'Comment: {_truncate_text(comment, 2000)}')
+
+    metadata = {
+        'type': 'column',
+        'database': schema,
+        'table': table,
+        'column': column,
+        'dataType': data_type,
+        'ordinalPosition': ordinal,
+        'nullable': is_nullable,
+    }
+    if default_value not in (None, ''):
+        metadata['default'] = default_value
+
+    return '\n'.join(lines), metadata
+
+
+def _parse_result_identifier(result_id: str) -> tuple[str, List[str]]:
+    if result_id.startswith('table:'):
+        remainder = result_id.split(':', 1)[1]
+        parts = remainder.split('.', 1)
+        if len(parts) != 2:
+            raise ToolError(f'Invalid table identifier: {result_id}')
+        return 'table', parts
+    if result_id.startswith('column:'):
+        remainder = result_id.split(':', 1)[1]
+        parts = remainder.split('.', 2)
+        if len(parts) != 3:
+            raise ToolError(f'Invalid column identifier: {result_id}')
+        return 'column', parts
+    raise ToolError(f'Unsupported result identifier: {result_id}')
+
+
+@mcp.tool(
+    name='fetch',
+    description='Fetch detailed metadata for a StarRocks search result identifier.',
+    tags={'search'},
+    annotations={'mcp:action': 'fetch'},
+)
+def fetch_metadata(
+    id: Annotated[str, Field(description='Identifier returned from the search tool.')],
+) -> ToolResult:
+    result_type, parts = _parse_result_identifier(id)
+
+    if result_type == 'table':
+        schema, table = parts
+        overview = _get_table_details(schema, table)
+        metadata = {
+            'type': 'table',
+            'database': schema,
+            'table': table,
+        }
+        structured = {
+            'id': id,
+            'title': f'Table {schema}.{table}',
+            'text': overview,
+            'metadata': metadata,
+        }
+        return ToolResult(content=[TextContent(type='text', text=overview)], structured_content=structured)
+
+    schema, table, column = parts
+    column_sql = (
+        "SELECT table_schema, table_name, column_name, data_type, IFNULL(column_comment, ''), ordinal_position, "
+        "is_nullable, IFNULL(column_default, '') "
+        "FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s AND column_name = %s"
+    )
+    column_result = db_client.execute(
+        column_sql,
+        params=(schema, table, column),
+        db='information_schema',
+    )
+    if not column_result.success:
+        raise ToolError(f"Failed to fetch column metadata: {column_result.error_message}")
+
+    rows = column_result.rows or []
+    if not rows:
+        raise ToolError(f'Column {schema}.{table}.{column} not found.')
+
+    detail_text, metadata = _build_column_detail(rows[0])
+    structured = {
+        'id': id,
+        'title': f'Column {column} in {schema}.{table}',
+        'text': detail_text,
+        'metadata': metadata,
+    }
+    return ToolResult(content=[TextContent(type='text', text=detail_text)], structured_content=structured)
+
+
 SEARCH_ACTION_DEFINITION = ActionDefinition(
     name='search',
     title='Search StarRocks metadata',

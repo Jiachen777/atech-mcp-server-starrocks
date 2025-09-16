@@ -2,6 +2,7 @@ import base64
 import json
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from src.mcp_server_starrocks import server
 from src.mcp_server_starrocks.db_client import ResultSet
@@ -29,6 +30,19 @@ def _column_rows():
         ["analytics", "orders", "order_id", "BIGINT", "Primary key", 1],
         ["analytics", "orders", "order_date", "DATE", "", 2],
         ["sales", "daily_orders", "order_total", "DECIMAL", "", 3],
+    ]
+
+
+def _column_detail_row():
+    return [
+        "analytics",
+        "orders",
+        "order_id",
+        "BIGINT",
+        "Primary key",
+        1,
+        "NO",
+        None,
     ]
 
 
@@ -158,3 +172,63 @@ async def test_search_handler_wraps_results(monkeypatch):
 
     assert isinstance(result.root, server.SearchResult)
     assert len(result.root.results) == 2
+
+
+def test_search_tool_returns_structured_results(monkeypatch):
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        if "information_schema.tables" in statement:
+            return _make_result(_table_rows())
+        if "information_schema.columns" in statement:
+            return _make_result(_column_rows())
+        raise AssertionError("Unexpected statement")
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    tool_result = server.search_metadata.fn("order", limit=2)
+    structured = tool_result.structured_content
+
+    assert structured["results"][0]["id"] == "table:analytics.orders"
+    assert structured["meta"]["limit"] == 2
+    assert "nextCursor" in structured
+
+
+def test_fetch_tool_returns_table_overview(monkeypatch):
+    monkeypatch.setattr(server, "_get_table_details", lambda schema, table, limit=None: "TABLE OVERVIEW")
+
+    result = server.fetch_metadata.fn("table:analytics.orders")
+
+    assert result.structured_content["metadata"]["type"] == "table"
+    assert "TABLE OVERVIEW" in result.structured_content["text"]
+
+
+def test_fetch_tool_returns_column_details(monkeypatch):
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        if "information_schema.columns" in statement:
+            return _make_result([_column_detail_row()])
+        raise AssertionError("Unexpected statement")
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    result = server.fetch_metadata.fn("column:analytics.orders.order_id")
+
+    metadata = result.structured_content["metadata"]
+    assert metadata["type"] == "column"
+    assert metadata["column"] == "order_id"
+    assert "order_id" in result.structured_content["text"]
+
+
+def test_fetch_tool_handles_missing_column(monkeypatch):
+    empty = ResultSet(success=True, column_names=[], rows=[], execution_time=0.01)
+
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        return empty
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    with pytest.raises(ToolError):
+        server.fetch_metadata.fn("column:analytics.orders.unknown")
+
+
+def test_fetch_tool_validates_identifier():
+    with pytest.raises(ToolError):
+        server.fetch_metadata.fn("invalid-prefix:abc")
