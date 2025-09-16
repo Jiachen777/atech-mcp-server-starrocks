@@ -1,0 +1,160 @@
+import base64
+import json
+
+import pytest
+
+from src.mcp_server_starrocks import server
+from src.mcp_server_starrocks.db_client import ResultSet
+
+
+@pytest.fixture(scope="module")
+def anyio_backend():
+    return "asyncio"
+
+
+def _make_result(rows):
+    return ResultSet(success=True, column_names=[], rows=rows, execution_time=0.01)
+
+
+def _table_rows():
+    return [
+        ["analytics", "orders", "Orders table", "BASE TABLE"],
+        ["sales", "daily_orders", "Daily orders view", "VIEW"],
+        ["analytics", "customers", "Customer snapshot", "BASE TABLE"],
+    ]
+
+
+def _column_rows():
+    return [
+        ["analytics", "orders", "order_id", "BIGINT", "Primary key", 1],
+        ["analytics", "orders", "order_date", "DATE", "", 2],
+        ["sales", "daily_orders", "order_total", "DECIMAL", "", 3],
+    ]
+
+
+def test_perform_search_returns_tables_and_columns(monkeypatch):
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        if "information_schema.tables" in statement:
+            return _make_result(_table_rows())
+        if "information_schema.columns" in statement:
+            return _make_result(_column_rows())
+        raise AssertionError("Unexpected statement")
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    results, next_cursor, meta = server.perform_search("order", limit=2, cursor=None)
+
+    assert [r.id for r in results] == [
+        "table:analytics.orders",
+        "table:sales.daily_orders",
+    ]
+    assert all(r.metadata["type"] == "table" for r in results)
+    assert next_cursor is not None
+    assert meta == {
+        "query": "order",
+        "limit": 2,
+        "tablesReturned": 2,
+        "columnsReturned": 0,
+    }
+
+    # next page continues from cursor and returns remaining tables/columns
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    results2, next_cursor2, meta2 = server.perform_search("order", limit=2, cursor=next_cursor)
+
+    assert [r.id for r in results2] == [
+        "table:analytics.customers",
+        "column:analytics.orders.order_id",
+    ]
+    assert results2[0].metadata["type"] == "table"
+    assert results2[1].metadata["type"] == "column"
+    assert next_cursor2 is not None
+    assert meta2 == {
+        "query": "order",
+        "limit": 2,
+        "tablesReturned": 1,
+        "columnsReturned": 1,
+    }
+
+    # final page contains remaining column entries
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    results3, next_cursor3, meta3 = server.perform_search("order", limit=2, cursor=next_cursor2)
+
+    assert [r.id for r in results3] == [
+        "column:analytics.orders.order_date",
+        "column:sales.daily_orders.order_total",
+    ]
+    assert next_cursor3 is None
+    assert meta3 == {
+        "query": "order",
+        "limit": 2,
+        "tablesReturned": 0,
+        "columnsReturned": 2,
+    }
+
+
+def test_perform_search_ignores_invalid_cursor(monkeypatch):
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        if "information_schema.tables" in statement:
+            return _make_result(_table_rows())
+        if "information_schema.columns" in statement:
+            return _make_result(_column_rows())
+        raise AssertionError("Unexpected statement")
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    # supply a malformed cursor that should be ignored gracefully
+    bad_cursor = base64.urlsafe_b64encode(json.dumps({"table": -5}).encode()).decode()
+    results, next_cursor, meta = server.perform_search("order", limit=2, cursor=bad_cursor)
+
+    assert results[0].id == "table:analytics.orders"
+    assert next_cursor is not None
+    assert meta == {
+        "query": "order",
+        "limit": 2,
+        "tablesReturned": 2,
+        "columnsReturned": 0,
+    }
+
+
+def test_perform_search_validates_query(monkeypatch):
+    with pytest.raises(ValueError):
+        server.perform_search("   ", limit=5, cursor=None)
+
+
+def test_perform_search_propagates_db_errors(monkeypatch):
+    failure = ResultSet(success=False, error_message="boom", execution_time=0.01)
+
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        return failure
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    with pytest.raises(RuntimeError):
+        server.perform_search("order", limit=1, cursor=None)
+
+
+@pytest.mark.anyio("asyncio")
+async def test_list_actions_includes_search():
+    request = server.ListActionsRequest(params=None)
+    result = await server._list_actions_handler(request)
+    actions = result.root.actions
+    assert any(action.name == "search" for action in actions)
+
+
+@pytest.mark.anyio("asyncio")
+async def test_search_handler_wraps_results(monkeypatch):
+    def fake_execute(statement, params=None, db=None, return_format="raw"):
+        if "information_schema.tables" in statement:
+            return _make_result(_table_rows())
+        if "information_schema.columns" in statement:
+            return _make_result(_column_rows())
+        raise AssertionError("Unexpected statement")
+
+    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+
+    params = server.SearchRequestParams(query="order", limit=2, cursor=None)
+    request = server.SearchRequest(params=params)
+    result = await server._search_handler(request)
+
+    assert isinstance(result.root, server.SearchResult)
+    assert len(result.root.results) == 2

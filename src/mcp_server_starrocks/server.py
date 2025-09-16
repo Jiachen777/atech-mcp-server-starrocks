@@ -14,18 +14,22 @@
 import argparse
 import ast
 import asyncio
+import base64
+import hashlib
 import json
 import math
 import sys
 import os
 import traceback
 from fastmcp import FastMCP
+from fastmcp.server.low_level import LowLevelServer
 from fastmcp.utilities.types import Image
 from fastmcp.tools.tool import ToolResult
+import mcp.types as mcp_types
 from mcp.types import TextContent, ImageContent
 from fastmcp.exceptions import ToolError
-from typing import Annotated
-from pydantic import Field
+from typing import Annotated, Any, Dict, List, Optional, Literal
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 import plotly.express as px
 import plotly.graph_objs
 from loguru import logger
@@ -76,6 +80,371 @@ Internal information exposed by StarRocks similar to linux /proc, following are 
 '/catalog'	Shows the information of catalogs.
 '''
 
+
+
+# ---------------------------------------------------------------------------
+# MCP actions/search support
+# ---------------------------------------------------------------------------
+
+DEFAULT_SEARCH_LIMIT = int(os.getenv('STARROCKS_SEARCH_LIMIT', '10'))
+MAX_SEARCH_LIMIT = int(os.getenv('STARROCKS_SEARCH_MAX_LIMIT', '50'))
+
+
+class ActionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    title: Optional[str] = None
+    inputSchema: Dict[str, Any] | None = None
+    annotations: Dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra='allow')
+
+
+class ListActionsResult(mcp_types.PaginatedResult):
+    actions: List[ActionDefinition]
+
+    model_config = ConfigDict(extra='allow')
+
+
+class ListActionsRequest(mcp_types.PaginatedRequest[Literal['actions/list']]):
+    method: Literal['actions/list'] = 'actions/list'
+
+
+class SearchRequestParams(mcp_types.PaginatedRequestParams):
+    query: str
+    limit: Optional[int] = Field(default=None, ge=1, le=MAX_SEARCH_LIMIT)
+    cursor: Optional[str] = None
+
+    model_config = ConfigDict(extra='allow')
+
+
+class SearchRequest(mcp_types.PaginatedRequest[Literal['actions/search']]):
+    method: Literal['actions/search'] = 'actions/search'
+    params: SearchRequestParams
+
+
+class SearchResultItem(BaseModel):
+    id: str
+    title: str
+    content: str
+    score: Optional[float] = None
+    metadata: Dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra='allow')
+
+
+class SearchResult(mcp_types.PaginatedResult):
+    results: List[SearchResultItem]
+
+    model_config = ConfigDict(extra='allow')
+
+
+class _ExtendedClientRequest(
+    RootModel[
+        mcp_types.PingRequest
+        | mcp_types.InitializeRequest
+        | mcp_types.CompleteRequest
+        | mcp_types.SetLevelRequest
+        | mcp_types.GetPromptRequest
+        | mcp_types.ListPromptsRequest
+        | mcp_types.ListResourcesRequest
+        | mcp_types.ListResourceTemplatesRequest
+        | mcp_types.ReadResourceRequest
+        | mcp_types.SubscribeRequest
+        | mcp_types.UnsubscribeRequest
+        | mcp_types.CallToolRequest
+        | mcp_types.ListToolsRequest
+        | ListActionsRequest
+        | SearchRequest
+    ]
+):
+    pass
+
+
+class _ExtendedServerResult(
+    RootModel[
+        mcp_types.EmptyResult
+        | mcp_types.InitializeResult
+        | mcp_types.CompleteResult
+        | mcp_types.GetPromptResult
+        | mcp_types.ListPromptsResult
+        | mcp_types.ListResourcesResult
+        | mcp_types.ListResourceTemplatesResult
+        | mcp_types.ReadResourceResult
+        | mcp_types.CallToolResult
+        | mcp_types.ListToolsResult
+        | ListActionsResult
+        | SearchResult
+    ]
+):
+    pass
+
+
+mcp_types.ActionDefinition = ActionDefinition
+mcp_types.ListActionsRequest = ListActionsRequest
+mcp_types.ListActionsResult = ListActionsResult
+mcp_types.SearchRequestParams = SearchRequestParams
+mcp_types.SearchRequest = SearchRequest
+mcp_types.SearchResultItem = SearchResultItem
+mcp_types.SearchResult = SearchResult
+mcp_types.ClientRequest = _ExtendedClientRequest
+mcp_types.ServerResult = _ExtendedServerResult
+
+_ExtendedClientRequest.model_rebuild()
+_ExtendedServerResult.model_rebuild()
+
+
+_original_get_capabilities = LowLevelServer.get_capabilities
+
+
+def _get_capabilities_with_actions(self, notification_options, experimental_capabilities):
+    capabilities = _original_get_capabilities(self, notification_options, experimental_capabilities)
+    if getattr(self, '_actions_enabled', False):
+        try:
+            setattr(capabilities, 'actions', {'listChanged': False})
+        except Exception:
+            capabilities.__dict__['actions'] = {'listChanged': False}
+    return capabilities
+
+
+LowLevelServer.get_capabilities = _get_capabilities_with_actions
+
+
+def _truncate_text(value: Optional[str], max_length: int = 400) -> str:
+    if not value:
+        return ''
+    text = value.strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1].rstrip() + '…'
+
+
+def _compute_match_score(name: str, comment: Optional[str], query: str) -> float:
+    normalized_name = name.lower()
+    normalized_query = query.lower()
+    comment_text = (comment or '').lower()
+    if normalized_name == normalized_query:
+        return 1.0
+    if normalized_name.startswith(normalized_query):
+        return 0.9
+    if normalized_query in normalized_name:
+        return 0.75
+    if comment_text and normalized_query in comment_text:
+        return 0.6
+    return 0.3
+
+
+def _decode_search_cursor(cursor: str, expected_hash: str) -> Dict[str, int]:
+    state = {'table': 0, 'column': 0}
+    try:
+        decoded = base64.urlsafe_b64decode(cursor.encode('utf-8')).decode('utf-8')
+        payload = json.loads(decoded)
+        if payload.get('hash') != expected_hash:
+            return state
+        table_offset = int(payload.get('table', 0))
+        column_offset = int(payload.get('column', 0))
+        if table_offset < 0 or column_offset < 0:
+            return state
+        state['table'] = table_offset
+        state['column'] = column_offset
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f'Ignoring invalid search cursor: {exc}')
+    return state
+
+
+def _encode_search_cursor(table_offset: int, column_offset: int, query_hash: str) -> str:
+    payload = {'hash': query_hash, 'table': table_offset, 'column': column_offset}
+    raw = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    return base64.urlsafe_b64encode(raw).decode('utf-8')
+
+
+def _build_table_result(row: List[Any], query: str) -> SearchResultItem:
+    schema, table, comment, table_type = row
+    title_prefix = 'View' if (table_type or '').upper() == 'VIEW' else 'Table'
+    summary_lines = [f'Database: {schema}', f'Table: {table}']
+    if table_type:
+        summary_lines.append(f'Type: {table_type}')
+    if comment:
+        summary_lines.append(f'Comment: {_truncate_text(comment)}')
+    metadata = {
+        'type': 'table',
+        'database': schema,
+        'table': table,
+        'tableType': table_type or 'BASE TABLE',
+    }
+    return SearchResultItem(
+        id=f'table:{schema}.{table}',
+        title=f'{title_prefix} {schema}.{table}',
+        content='\n'.join(summary_lines),
+        score=_compute_match_score(str(table), comment, query),
+        metadata=metadata,
+    )
+
+
+def _build_column_result(row: List[Any], query: str) -> SearchResultItem:
+    schema, table, column, data_type, comment, ordinal = row
+    summary_lines = [
+        f'Database: {schema}',
+        f'Table: {table}',
+        f'Column: {column}',
+        f'Type: {data_type}',
+    ]
+    if comment:
+        summary_lines.append(f'Comment: {_truncate_text(comment)}')
+    metadata = {
+        'type': 'column',
+        'database': schema,
+        'table': table,
+        'column': column,
+        'dataType': data_type,
+        'ordinalPosition': ordinal,
+    }
+    return SearchResultItem(
+        id=f'column:{schema}.{table}.{column}',
+        title=f'Column {column} in {schema}.{table}',
+        content='\n'.join(summary_lines),
+        score=_compute_match_score(str(column), comment, query),
+        metadata=metadata,
+    )
+
+
+def perform_search(query: str, limit: Optional[int], cursor: Optional[str]) -> tuple[List[SearchResultItem], Optional[str], Dict[str, Any]]:
+    normalized_query = query.strip()
+    if not normalized_query:
+        raise ValueError('Search query cannot be empty.')
+
+    normalized_limit = DEFAULT_SEARCH_LIMIT if limit is None else max(1, min(limit, MAX_SEARCH_LIMIT))
+    lowered_query = normalized_query.lower()
+    query_hash = hashlib.sha1(lowered_query.encode('utf-8')).hexdigest()
+    cursor_state = {'table': 0, 'column': 0}
+    if cursor:
+        cursor_state = _decode_search_cursor(cursor, query_hash)
+
+    pattern = f'%{lowered_query}%'
+    table_fetch_limit = cursor_state['table'] + normalized_limit + 1
+    column_fetch_limit = cursor_state['column'] + normalized_limit + 1
+
+    table_sql = (
+        "SELECT table_schema, table_name, IFNULL(table_comment, ''), table_type "
+        "FROM information_schema.tables "
+        "WHERE LOWER(table_name) LIKE %s OR LOWER(IFNULL(table_comment, '')) LIKE %s "
+        "ORDER BY CASE WHEN LOWER(table_name) LIKE %s THEN 0 ELSE 1 END, table_schema, table_name "
+        "LIMIT %s"
+    )
+    table_result = db_client.execute(
+        table_sql,
+        params=(pattern, pattern, pattern, table_fetch_limit),
+        db='information_schema',
+    )
+    if not table_result.success:
+        raise RuntimeError(f"Failed to search tables: {table_result.error_message}")
+
+    table_rows = table_result.rows or []
+    table_rows = table_rows[cursor_state['table'] : cursor_state['table'] + normalized_limit + 1]
+
+    column_sql = (
+        "SELECT table_schema, table_name, column_name, data_type, IFNULL(column_comment, ''), ordinal_position "
+        "FROM information_schema.columns "
+        "WHERE LOWER(column_name) LIKE %s OR LOWER(IFNULL(column_comment, '')) LIKE %s "
+        "ORDER BY CASE WHEN LOWER(column_name) LIKE %s THEN 0 ELSE 1 END, table_schema, table_name, ordinal_position "
+        "LIMIT %s"
+    )
+    column_result = db_client.execute(
+        column_sql,
+        params=(pattern, pattern, pattern, column_fetch_limit),
+        db='information_schema',
+    )
+    if not column_result.success:
+        raise RuntimeError(f"Failed to search columns: {column_result.error_message}")
+
+    column_rows = column_result.rows or []
+    column_rows = column_rows[cursor_state['column'] : cursor_state['column'] + normalized_limit + 1]
+
+    results: List[SearchResultItem] = []
+    table_consumed = 0
+    for row in table_rows[:normalized_limit]:
+        results.append(_build_table_result(row, normalized_query))
+        table_consumed += 1
+        if len(results) >= normalized_limit:
+            break
+
+    column_consumed = 0
+    if len(results) < normalized_limit:
+        remaining = normalized_limit - len(results)
+        for row in column_rows[:remaining]:
+            results.append(_build_column_result(row, normalized_query))
+            column_consumed += 1
+
+    has_more_tables = len(table_rows) > table_consumed
+    has_more_columns = len(column_rows) > column_consumed
+    next_cursor: Optional[str] = None
+    if has_more_tables or has_more_columns:
+        next_cursor = _encode_search_cursor(
+            cursor_state['table'] + table_consumed,
+            cursor_state['column'] + column_consumed,
+            query_hash,
+        )
+
+    metadata = {
+        'query': normalized_query,
+        'limit': normalized_limit,
+        'tablesReturned': table_consumed,
+        'columnsReturned': column_consumed,
+    }
+    return results, next_cursor, metadata
+
+
+SEARCH_ACTION_DEFINITION = ActionDefinition(
+    name='search',
+    title='Search StarRocks metadata',
+    description='Search StarRocks tables and columns using a keyword.',
+    inputSchema={
+        'type': 'object',
+        'properties': {
+            'query': {
+                'type': 'string',
+                'description': 'Keyword or phrase to search for in table and column metadata.',
+            },
+            'limit': {
+                'type': 'integer',
+                'minimum': 1,
+                'maximum': MAX_SEARCH_LIMIT,
+                'description': 'Maximum number of results to return per page.',
+            },
+            'cursor': {
+                'type': 'string',
+                'description': 'Opaque cursor returned from a previous search call for pagination.',
+            },
+        },
+        'required': ['query'],
+        'additionalProperties': False,
+    },
+    annotations={'tags': ['search']},
+)
+
+
+async def _list_actions_handler(_: ListActionsRequest) -> mcp_types.ServerResult:
+    return mcp_types.ServerResult(ListActionsResult(actions=[SEARCH_ACTION_DEFINITION]))
+
+
+async def _search_handler(request: SearchRequest) -> mcp_types.ServerResult:
+    params = request.params
+    results, next_cursor, metadata = perform_search(params.query, params.limit, params.cursor)
+    search_result = SearchResult(results=results, nextCursor=next_cursor, meta=metadata)
+    return mcp_types.ServerResult(search_result)
+
+
+def _register_search_action():
+    if getattr(mcp._mcp_server, '_search_action_registered', False):
+        return
+    mcp._mcp_server._actions_enabled = True
+    mcp._mcp_server._search_action_registered = True
+    mcp._mcp_server._search_action = SEARCH_ACTION_DEFINITION
+    mcp._mcp_server.request_handlers[ListActionsRequest] = _list_actions_handler
+    mcp._mcp_server.request_handlers[SearchRequest] = _search_handler
+
+
+_register_search_action()
 
 @mcp.resource(uri="starrocks:///databases", name="All Databases", description="List all databases in StarRocks",
               mime_type="text/plain")
