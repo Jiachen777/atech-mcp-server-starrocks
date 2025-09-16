@@ -17,7 +17,7 @@ import os
 import time
 import re
 import json
-from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired
+from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired, Sequence
 from dataclasses import dataclass
 import mysql.connector
 from mysql.connector import Error as MySQLError
@@ -401,16 +401,18 @@ class DBClient:
 
 
     def execute(
-        self, 
-        statement: str, 
+        self,
+        statement: str,
+        params: Optional[Sequence[Any]] = None,
         db: Optional[str] = None,
         return_format: Literal["raw", "pandas"] = "raw"
     ) -> ResultSet:
         """
         Execute a SQL statement and return results.
-        
+
         Args:
             statement: SQL statement to execute
+            params: Optional sequence of parameters for the SQL statement
             db: Optional database to use (overrides default)
             return_format: "raw" returns ResultSet with rows, "pandas" also populates pandas field
             
@@ -449,7 +451,7 @@ class DBClient:
                         execution_time=0
                     )
                 cursor_temp.close()
-            return self._execute(conn, statement, None, return_format)
+            return self._execute(conn, statement, params, return_format)
         except (MySQLError, adbcError) as e:
             self._handle_db_error(e)
             return ResultSet(

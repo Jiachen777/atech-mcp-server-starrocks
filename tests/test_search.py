@@ -2,10 +2,20 @@ import base64
 import json
 
 import pytest
+from unittest import mock
 from fastmcp.exceptions import ToolError
 
 from src.mcp_server_starrocks import server
 from src.mcp_server_starrocks.db_client import ResultSet
+
+
+_ORIGINAL_EXECUTE = server.db_client.execute
+
+
+def _patch_execute(monkeypatch, side_effect):
+    mock_execute = mock.create_autospec(_ORIGINAL_EXECUTE, side_effect=side_effect)
+    monkeypatch.setattr(server.db_client, "execute", mock_execute)
+    return mock_execute
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +64,7 @@ def test_perform_search_returns_tables_and_columns(monkeypatch):
             return _make_result(_column_rows())
         raise AssertionError("Unexpected statement")
 
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    mock_execute = _patch_execute(monkeypatch, fake_execute)
 
     results, next_cursor, meta = server.perform_search("order", limit=2, cursor=None)
 
@@ -70,9 +80,16 @@ def test_perform_search_returns_tables_and_columns(monkeypatch):
         "tablesReturned": 2,
         "columnsReturned": 0,
     }
+    assert mock_execute.call_count == 2
+    table_call, column_call = mock_execute.call_args_list
+    assert table_call.kwargs["db"] == "information_schema"
+    assert "params" in table_call.kwargs
+    assert column_call.kwargs["db"] == "information_schema"
+    assert "params" in column_call.kwargs
+
+    mock_execute.reset_mock()
 
     # next page continues from cursor and returns remaining tables/columns
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
     results2, next_cursor2, meta2 = server.perform_search("order", limit=2, cursor=next_cursor)
 
     assert [r.id for r in results2] == [
@@ -88,9 +105,11 @@ def test_perform_search_returns_tables_and_columns(monkeypatch):
         "tablesReturned": 1,
         "columnsReturned": 1,
     }
+    assert mock_execute.call_count == 2
+
+    mock_execute.reset_mock()
 
     # final page contains remaining column entries
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
     results3, next_cursor3, meta3 = server.perform_search("order", limit=2, cursor=next_cursor2)
 
     assert [r.id for r in results3] == [
@@ -114,7 +133,7 @@ def test_perform_search_ignores_invalid_cursor(monkeypatch):
             return _make_result(_column_rows())
         raise AssertionError("Unexpected statement")
 
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    _patch_execute(monkeypatch, fake_execute)
 
     # supply a malformed cursor that should be ignored gracefully
     bad_cursor = base64.urlsafe_b64encode(json.dumps({"table": -5}).encode()).decode()
@@ -141,7 +160,7 @@ def test_perform_search_propagates_db_errors(monkeypatch):
     def fake_execute(statement, params=None, db=None, return_format="raw"):
         return failure
 
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    _patch_execute(monkeypatch, fake_execute)
 
     with pytest.raises(RuntimeError):
         server.perform_search("order", limit=1, cursor=None)
@@ -164,7 +183,7 @@ async def test_search_handler_wraps_results(monkeypatch):
             return _make_result(_column_rows())
         raise AssertionError("Unexpected statement")
 
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    _patch_execute(monkeypatch, fake_execute)
 
     params = server.SearchRequestParams(query="order", limit=2, cursor=None)
     request = server.SearchRequest(params=params)
@@ -182,7 +201,7 @@ def test_search_tool_returns_structured_results(monkeypatch):
             return _make_result(_column_rows())
         raise AssertionError("Unexpected statement")
 
-    monkeypatch.setattr(server.db_client, "execute", fake_execute)
+    _patch_execute(monkeypatch, fake_execute)
 
     tool_result = server.search_metadata.fn("order", limit=2)
     structured = tool_result.structured_content
