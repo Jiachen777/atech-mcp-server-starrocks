@@ -19,12 +19,13 @@ import math
 import sys
 import os
 import traceback
+from difflib import SequenceMatcher
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent, ImageContent
 from fastmcp.exceptions import ToolError
-from typing import Annotated
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Set
 from pydantic import Field
 import plotly.express as px
 import plotly.graph_objs
@@ -75,6 +76,133 @@ Internal information exposed by StarRocks similar to linux /proc, following are 
 '/colocation_group'	Shows the information of Colocate Join groups.
 '/catalog'	Shows the information of catalogs.
 '''
+
+
+DISCOVERY_EXCLUDED_TOOL_NAMES: Set[str] = {'search', 'fetch'}
+
+
+def _build_discoverable_index(
+        *, include_disabled: bool = False, types_filter: Optional[Set[str]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Collect metadata about tools and resources for discovery."""
+    normalized_types: Optional[Set[str]] = None
+    if types_filter:
+        normalized_types = {item.lower() for item in types_filter}
+
+    items: Dict[str, Dict[str, Any]] = {}
+
+    tool_manager = getattr(mcp, '_tool_manager', None)
+    if tool_manager is not None:
+        for tool in tool_manager._tools.values():  # type: ignore[attr-defined]
+            if not include_disabled and not tool.enabled:
+                continue
+            if tool.name in DISCOVERY_EXCLUDED_TOOL_NAMES:
+                continue
+            item_type = 'tool'
+            if normalized_types and item_type not in normalized_types:
+                continue
+            annotations = tool.annotations.model_dump(exclude_none=True) if tool.annotations else None
+            items[f'tool:{tool.key}'] = {
+                'id': f'tool:{tool.key}',
+                'type': item_type,
+                'name': tool.name,
+                'title': tool.title or tool.name,
+                'description': tool.description or '',
+                'tags': sorted(tool.tags) if tool.tags else [],
+                'annotations': annotations,
+                'input_schema': tool.parameters,
+                'output_schema': tool.output_schema,
+                'call': {'type': 'tool', 'name': tool.name},
+                '_object': tool,
+            }
+
+    resource_manager = getattr(mcp, '_resource_manager', None)
+    if resource_manager is not None:
+        for resource in resource_manager._resources.values():  # type: ignore[attr-defined]
+            if not include_disabled and not resource.enabled:
+                continue
+            item_type = 'resource'
+            if normalized_types and item_type not in normalized_types:
+                continue
+            annotations = resource.annotations.model_dump(exclude_none=True) if resource.annotations else None
+            items[f'resource:{resource.key}'] = {
+                'id': f'resource:{resource.key}',
+                'type': item_type,
+                'name': resource.name,
+                'title': resource.title or resource.name,
+                'description': resource.description or '',
+                'tags': sorted(resource.tags) if resource.tags else [],
+                'annotations': annotations,
+                'uri': str(resource.uri),
+                'mime_type': resource.mime_type,
+                'call': {'type': 'resource', 'uri': str(resource.uri)},
+                '_object': resource,
+            }
+
+        for template in resource_manager._templates.values():  # type: ignore[attr-defined]
+            if not include_disabled and not template.enabled:
+                continue
+            item_type = 'resource-template'
+            if normalized_types and item_type not in normalized_types:
+                continue
+            annotations = template.annotations.model_dump(exclude_none=True) if template.annotations else None
+            items[f'resource-template:{template.key}'] = {
+                'id': f'resource-template:{template.key}',
+                'type': item_type,
+                'name': template.name,
+                'title': template.title or template.name,
+                'description': template.description or '',
+                'tags': sorted(template.tags) if template.tags else [],
+                'annotations': annotations,
+                'uri_template': template.uri_template,
+                'parameters': template.parameters,
+                'mime_type': template.mime_type,
+                'call': {'type': 'resource-template', 'uri_template': template.uri_template},
+                '_object': template,
+            }
+
+    return items
+
+
+def _score_item(query: str, item: Dict[str, Any]) -> float:
+    """Compute a relevance score for the provided discovery item."""
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return 1.0
+
+    haystack_parts: List[str] = []
+    for key in ('name', 'title', 'description'):
+        value = item.get(key)
+        if value:
+            haystack_parts.append(str(value))
+
+    tags: Sequence[str] = item.get('tags', []) or []
+    haystack_parts.extend(tags)
+
+    if item['type'] == 'resource' and item.get('uri'):
+        haystack_parts.append(str(item['uri']))
+    elif item['type'] == 'resource-template' and item.get('uri_template'):
+        haystack_parts.append(str(item['uri_template']))
+    elif item['type'] == 'tool':
+        input_schema: Optional[Dict[str, Any]] = item.get('input_schema')
+        if input_schema:
+            properties = input_schema.get('properties', {})
+            if isinstance(properties, dict):
+                haystack_parts.extend(list(properties.keys()))
+
+    haystack = ' '.join(part for part in haystack_parts if part)
+    haystack_lower = haystack.lower()
+    if not haystack_lower:
+        return 0.0
+
+    ratio = SequenceMatcher(None, normalized_query, haystack_lower).ratio()
+    term_hits = sum(1 for term in normalized_query.split() if term and term in haystack_lower)
+    substring_bonus = 0.5 if normalized_query in haystack_lower else 0.0
+
+    score = ratio + term_hits + substring_bonus
+    if term_hits == 0 and substring_bonus == 0.0 and ratio < 0.2:
+        return 0.0
+    return score
 
 
 @mcp.resource(uri="starrocks:///databases", name="All Databases", description="List all databases in StarRocks",
@@ -174,6 +302,146 @@ def _get_table_details(db_name, table_name, limit=None):
 
 
 # tools
+
+
+@mcp.tool(name='search', description='Search available StarRocks MCP tools and resources for relevant capabilities.')
+def search(
+        query: Annotated[str, Field(description='Query text used to match tools, resources, or resource templates')],
+        limit: Annotated[int, Field(description='Maximum number of results to return', ge=1, le=50)] = 10,
+        types: Annotated[Sequence[str] | None, Field(description='Optional list of result types to include (tool, resource, resource-template)')] = None,
+) -> ToolResult:
+    logger.info(f"Discovery search requested: query='{query}', limit={limit}, types={types}")
+    limit = max(1, min(limit, 50))
+    types_filter: Optional[Set[str]] = {t.lower() for t in types} if types else None
+
+    index = _build_discoverable_index(types_filter=types_filter)
+    items = list(index.values())
+
+    scored_entries: List[tuple[float, Dict[str, Any]]] = []
+    cleaned_query = query or ''
+    for item in items:
+        score = _score_item(cleaned_query, item) if cleaned_query.strip() else 1.0
+        if cleaned_query.strip() and score <= 0:
+            continue
+        entry: Dict[str, Any] = {
+            'id': item['id'],
+            'type': item['type'],
+            'name': item['name'],
+            'title': item.get('title'),
+            'description': item.get('description'),
+            'tags': item.get('tags', []),
+            'call': item.get('call'),
+            'score': round(score, 4),
+        }
+        if item['type'] == 'resource':
+            entry['uri'] = item.get('uri')
+            entry['mime_type'] = item.get('mime_type')
+        elif item['type'] == 'resource-template':
+            entry['uri_template'] = item.get('uri_template')
+            entry['mime_type'] = item.get('mime_type')
+        scored_entries.append((score, entry))
+
+    scored_entries.sort(key=lambda pair: pair[0], reverse=True)
+    top_results = [entry for _, entry in scored_entries[:limit]]
+
+    text_lines = []
+    if cleaned_query.strip():
+        text_lines.append(f"Found {len(scored_entries)} result(s) for query '{cleaned_query}'. Showing top {len(top_results)}.")
+    else:
+        text_lines.append(f"Listing top {len(top_results)} available capabilities (no query provided).")
+
+    for entry in top_results:
+        display_name = entry.get('title') or entry['name']
+        text_lines.append(f"- [{entry['type']}] {display_name} (id={entry['id']}, score={entry['score']:.2f})")
+
+    structured: Dict[str, Any] = {
+        'query': cleaned_query,
+        'limit': limit,
+        'returned': len(top_results),
+        'results': top_results,
+    }
+    if types_filter:
+        structured['types'] = sorted(types_filter)
+
+    return ToolResult(
+        content=[TextContent(type='text', text='\n'.join(text_lines))],
+        structured_content=structured,
+    )
+
+
+@mcp.tool(name='fetch', description='Fetch detailed metadata for results returned by the search action.')
+def fetch(
+        ids: Annotated[Sequence[str], Field(description='IDs previously returned from the search action')],
+        include_schemas: Annotated[bool, Field(description='Include JSON schema definitions for tools and templates')] = True,
+) -> ToolResult:
+    id_list = list(ids) if not isinstance(ids, str) else [ids]
+    logger.info(f"Discovery fetch requested for ids={id_list}, include_schemas={include_schemas}")
+
+    index = _build_discoverable_index(include_disabled=True)
+    results: List[Dict[str, Any]] = []
+    missing: List[str] = []
+
+    for item_id in id_list:
+        item = index.get(item_id)
+        if not item:
+            missing.append(item_id)
+            continue
+
+        detail: Dict[str, Any] = {
+            'id': item['id'],
+            'type': item['type'],
+            'name': item['name'],
+            'title': item.get('title'),
+            'description': item.get('description'),
+            'tags': item.get('tags', []),
+            'call': item.get('call'),
+        }
+
+        component = item.get('_object')
+        try:
+            if item['type'] == 'tool' and component is not None:
+                tool_payload = component.to_mcp_tool(include_fastmcp_meta=True)
+                tool_dict = tool_payload.model_dump(by_alias=True, exclude_none=True)
+                if not include_schemas:
+                    tool_dict.pop('inputSchema', None)
+                    tool_dict.pop('outputSchema', None)
+                detail['tool'] = tool_dict
+            elif item['type'] == 'resource' and component is not None:
+                detail['resource'] = component.to_mcp_resource(include_fastmcp_meta=True).model_dump(by_alias=True, exclude_none=True)
+            elif item['type'] == 'resource-template' and component is not None:
+                template_dict = component.to_mcp_template(include_fastmcp_meta=True).model_dump(by_alias=True, exclude_none=True)
+                if not include_schemas:
+                    template_dict.pop('parameters', None)
+                detail['resourceTemplate'] = template_dict
+        except Exception as exc:  # noqa: BLE001 - surface unexpected serialization problems
+            logger.error(f"Failed to build metadata for {item_id}: {exc}")
+            detail['error'] = str(exc)
+
+        if item['type'] == 'resource':
+            detail['uri'] = item.get('uri')
+            detail['mime_type'] = item.get('mime_type')
+        elif item['type'] == 'resource-template':
+            detail['uri_template'] = item.get('uri_template')
+            detail['mime_type'] = item.get('mime_type')
+
+        results.append(detail)
+
+    text_lines = [f"Fetched metadata for {len(results)} item(s)."]
+    for detail in results:
+        display_name = detail.get('title') or detail['name']
+        text_lines.append(f"- [{detail['type']}] {display_name} (id={detail['id']})")
+    if missing:
+        text_lines.append(f"Missing ids: {', '.join(missing)}")
+
+    structured: Dict[str, Any] = {'items': results}
+    if missing:
+        structured['missing'] = missing
+
+    return ToolResult(
+        content=[TextContent(type='text', text='\n'.join(text_lines))],
+        structured_content=structured,
+    )
+
 
 @mcp.tool(description="Execute a SELECT query or commands that return a ResultSet" + description_suffix)
 def read_query(query: Annotated[str, Field(description="SQL query to execute")],
