@@ -167,6 +167,8 @@ uv run mcp-server-starrocks --test
 
 **Environment Variables:**
 
+For local development you can copy `.env_example` to `.env` and adjust the values as needed. The project root `.env` file is ignored by git and provides a convenient place to store your StarRocks connection details and API server configuration without committing secrets.
+
 ### Connection Configuration
 
 You can configure StarRocks connection using either individual environment variables or a single connection URL:
