@@ -8,6 +8,7 @@ requires-python = ">=3.10"
 dependencies = [
     "loguru>=0.7.3",
     "fastmcp>=2.12.0,<2.13.0",
+    "fastapi>=0.115.0",
     "mysql-connector-python>=9.2.0",
     "pandas>=2.2.3",
     "plotly>=6.0.1",
@@ -15,6 +16,7 @@ dependencies = [
     "adbc-driver-manager>=0.8.0",
     "adbc-driver-flightsql>=0.8.0",
     "pyarrow>=14.0.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +35,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 mcp-server-starrocks = "mcp_server_starrocks:main"
+starrocks-api-server = "starrocks_api_server.main:main"
 
 [project.urls]
 Home = "https://github.com/starrocks/mcp-server-starrocks"
