@@ -159,18 +159,12 @@ def auth_headers() -> Dict[str, str]:
     return {"Authorization": "Bearer test-token"}
 
 
-def test_openapi_includes_default_public_server(monkeypatch):
-    monkeypatch.delenv("STARROCKS_API_PUBLIC_URL", raising=False)
+def test_openapi_advertises_devicesformula_host():
     app = create_app()
     schema = app.openapi()
-    assert schema["servers"] == [{"url": "http://localhost:8002"}]
-
-
-def test_openapi_respects_public_server_override(monkeypatch):
-    monkeypatch.setenv("STARROCKS_API_PUBLIC_URL", "https://starrocks.example.com/api/")
-    app = create_app()
-    schema = app.openapi()
-    assert schema["servers"] == [{"url": "https://starrocks.example.com/api"}]
+    assert schema["servers"] == [
+        {"url": "https://starrocks-mcp.devicesformula.com/api"}
+    ]
 
 
 def test_health_endpoint(api_client):

@@ -30,8 +30,7 @@ from mcp_server_starrocks.db_summary_manager import (
 )
 
 API_TOKEN_ENV = "STARROCKS_API_BEARER_TOKEN"
-PUBLIC_URL_ENV = "STARROCKS_API_PUBLIC_URL"
-DEFAULT_PUBLIC_URL = "http://localhost:8002"
+PUBLIC_SERVER_URL = "https://starrocks-mcp.devicesformula.com/api"
 DEFAULT_TABLE_OVERVIEW_LIMIT = int(os.getenv("STARROCKS_OVERVIEW_LIMIT", "20000"))
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -81,6 +80,142 @@ class TableOverviewResponse(BaseModel):
     sample_rows: List[Dict[str, Any]]
     errors: List[str]
     cache: Dict[str, Any]
+
+
+class HealthcheckResponse(BaseModel):
+    status: str = Field(..., description="Health status of the API server.")
+
+
+class BaseSuccessResponse(BaseModel):
+    success: bool = Field(..., description="Whether the request succeeded.")
+    error_message: Optional[str] = Field(
+        default=None, description="Error details when success is False."
+    )
+
+
+class ListDatabasesResponse(BaseSuccessResponse):
+    databases: List[str] = Field(
+        default_factory=list,
+        description="Names of databases visible to the authenticated user.",
+    )
+    execution_time: Optional[float] = Field(
+        default=None, description="Execution time reported by StarRocks."
+    )
+
+
+class ListTablesResponse(BaseSuccessResponse):
+    database: Optional[str] = Field(
+        default=None, description="Database associated with the listed tables."
+    )
+    tables: List[str] = Field(
+        default_factory=list,
+        description="Tables contained within the requested database.",
+    )
+    execution_time: Optional[float] = Field(
+        default=None, description="Execution time reported by StarRocks."
+    )
+
+
+class TableSchemaResponse(BaseSuccessResponse):
+    database: Optional[str] = Field(
+        default=None, description="Database containing the requested table."
+    )
+    table: Optional[str] = Field(
+        default=None, description="Table whose schema was requested."
+    )
+    schema_sql: Optional[str] = Field(
+        default=None, description="CREATE TABLE statement for the table."
+    )
+    format: Optional[str] = Field(
+        default=None, description="Schema output format."
+    )
+
+
+class ProcResponse(BaseSuccessResponse):
+    path: Optional[str] = Field(
+        default=None, description="`SHOW PROC` path that was queried."
+    )
+    content: Optional[str] = Field(
+        default=None, description="Textual response returned by StarRocks."
+    )
+
+
+class QueryResultResponse(BaseSuccessResponse):
+    execution_time: Optional[float] = Field(
+        default=None, description="Execution time reported by StarRocks."
+    )
+    columns: Optional[List[str]] = Field(
+        default=None, description="Column names returned by the query."
+    )
+    rows: Optional[List[List[Any]]] = Field(
+        default=None, description="Tabular rows returned by the query."
+    )
+    rows_affected: Optional[int] = Field(
+        default=None, description="Number of rows impacted by a write query."
+    )
+    preview: Optional[str] = Field(
+        default=None,
+        description="Textual preview of the query results.",
+    )
+    dataframe_preview: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Preview of the query results when rendered as records.",
+    )
+    data: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Plotly trace data generated for the query (when requested).",
+    )
+    layout: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Plotly layout metadata generated for the query (when requested).",
+    )
+
+
+class AnalyzeQueryResponse(BaseSuccessResponse):
+    analysis: Optional[str] = Field(
+        default=None, description="Output from ANALYZE PROFILE or EXPLAIN ANALYZE."
+    )
+
+
+class PerfCollectResponse(BaseSuccessResponse):
+    result: Optional[PerfAnalysisInput] = Field(
+        default=None,
+        description="Profiling payload generated for the supplied query.",
+    )
+
+
+class PlotChartPayload(BaseModel):
+    format: str = Field(..., description="Format of the chart payload.")
+    data: Optional[List[Dict[str, Any]]] = Field(
+        default=None, description="Plotly JSON data series."
+    )
+    layout: Optional[Dict[str, Any]] = Field(
+        default=None, description="Plotly JSON layout metadata."
+    )
+    image: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded PNG image of the rendered chart.",
+    )
+
+
+class PlotQueryResponse(BaseSuccessResponse):
+    chart: Optional[PlotChartPayload] = Field(
+        default=None, description="Rendered chart output."
+    )
+    query_result: Optional[QueryResultResponse] = Field(
+        default=None,
+        description="Structured representation of the executed query result.",
+    )
+
+
+class DatabaseSummaryResponse(BaseSuccessResponse):
+    database: str = Field(..., description="Database whose summary was requested.")
+    summary: Optional[str] = Field(
+        default=None,
+        description="Generated textual summary of the database.",
+    )
+    limit: int = Field(..., description="Character limit applied to the summary.")
+    refresh: bool = Field(..., description="Whether the summary bypassed the cache.")
 
 
 @dataclass
@@ -133,15 +268,7 @@ def validate_plotly_expr(expr: str) -> None:
 def resolve_public_server_url() -> str:
     """Return the externally accessible base URL advertised via OpenAPI."""
 
-    raw_value = os.getenv(PUBLIC_URL_ENV)
-    if raw_value is not None:
-        cleaned = raw_value.strip()
-        if cleaned:
-            # Normalise trailing slashes so GPT Actions sees a stable URL.
-            trimmed = cleaned.rstrip("/")
-            return trimmed or DEFAULT_PUBLIC_URL
-        # Fall back to default when the environment variable only contained whitespace.
-    return DEFAULT_PUBLIC_URL
+    return PUBLIC_SERVER_URL
 
 
 def create_app() -> FastAPI:
@@ -235,21 +362,26 @@ def rows_to_dicts(result: ResultSet) -> List[Dict[str, Any]]:
     return dictionaries
 
 
-def build_query_response(result: ResultSet) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "success": result.success,
-        "execution_time": result.execution_time,
-    }
+def build_query_response(result: ResultSet) -> QueryResultResponse:
+    rows: Optional[List[List[Any]]] = None
+    columns: Optional[List[str]] = None
     if result.column_names is not None:
-        payload["columns"] = list(result.column_names)
-        payload["rows"] = rows_to_lists(result.rows)
-    if result.rows_affected is not None:
-        payload["rows_affected"] = result.rows_affected
-    if result.error_message:
-        payload["error_message"] = result.error_message
+        columns = list(result.column_names)
+        rows = rows_to_lists(result.rows)
+
+    preview: Optional[str] = None
     if result.success:
-        payload["preview"] = result.to_string(limit=10000)
-    return payload
+        preview = result.to_string(limit=10000)
+
+    return QueryResultResponse(
+        success=result.success,
+        execution_time=result.execution_time,
+        columns=columns,
+        rows=rows,
+        rows_affected=result.rows_affected,
+        error_message=result.error_message,
+        preview=preview,
+    )
 
 
 def resolve_plot_response_format(requested: Optional[str]) -> Optional[str]:
@@ -312,56 +444,67 @@ def compute_table_overview(
     return overview_payload
 
 
-@router.get("/health")
-def healthcheck() -> Dict[str, str]:
-    return {"status": "ok"}
+@router.get("/health", response_model=HealthcheckResponse)
+def healthcheck() -> HealthcheckResponse:
+    return HealthcheckResponse(status="ok")
 
 
-@router.get("/databases", dependencies=[Depends(require_authentication)])
+@router.get(
+    "/databases",
+    response_model=ListDatabasesResponse,
+    dependencies=[Depends(require_authentication)],
+)
 def list_databases(
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> ListDatabasesResponse:
     result = db_client.execute("SHOW DATABASES")
     if not result.success:
-        return {
-            "success": False,
-            "error_message": result.error_message,
-        }
+        return ListDatabasesResponse(
+            success=False,
+            databases=[],
+            execution_time=result.execution_time,
+            error_message=result.error_message,
+        )
     databases = [row[0] for row in rows_to_lists(result.rows)]
-    return {
-        "success": True,
-        "databases": databases,
-        "execution_time": result.execution_time,
-    }
+    return ListDatabasesResponse(
+        success=True,
+        databases=databases,
+        execution_time=result.execution_time,
+    )
 
 
 @router.get(
     "/databases/{database}/tables",
+    response_model=ListTablesResponse,
     dependencies=[Depends(require_authentication)],
 )
 def list_tables(
     database: str,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> ListTablesResponse:
     result = db_client.execute(
         f"SHOW TABLES FROM {quote_identifier(database)}", db=database
     )
     if not result.success:
-        return {
-            "success": False,
-            "error_message": result.error_message,
-        }
+        return ListTablesResponse(
+            success=False,
+            database=database,
+            tables=[],
+            execution_time=result.execution_time,
+            error_message=result.error_message,
+        )
     tables = [row[0] for row in rows_to_lists(result.rows)]
-    return {
-        "success": True,
-        "database": database,
-        "tables": tables,
-        "execution_time": result.execution_time,
-    }
+    return ListTablesResponse(
+        success=True,
+        database=database,
+        tables=tables,
+        execution_time=result.execution_time,
+    )
 
 
 @router.get(
     "/databases/{database}/tables/{table}/schema",
+    response_model=TableSchemaResponse,
     dependencies=[Depends(require_authentication)],
 )
 def get_table_schema(
@@ -371,28 +514,32 @@ def get_table_schema(
         default="text", description="Return format. Only 'text' is currently supported."
     ),
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> TableSchemaResponse:
     result = db_client.execute(
         f"SHOW CREATE TABLE {quote_identifier(database)}.{quote_identifier(table)}",
         db=database,
     )
     if not result.success:
-        return {
-            "success": False,
-            "error_message": result.error_message,
-        }
+        return TableSchemaResponse(
+            success=False,
+            database=database,
+            table=table,
+            format=format,
+            error_message=result.error_message,
+        )
     schema_sql = result.to_string()
-    return {
-        "success": True,
-        "database": database,
-        "table": table,
-        "schema_sql": schema_sql,
-        "format": format,
-    }
+    return TableSchemaResponse(
+        success=True,
+        database=database,
+        table=table,
+        schema_sql=schema_sql,
+        format=format,
+    )
 
 
 @router.get(
     "/proc/{path:path}",
+    response_model=ProcResponse,
     dependencies=[Depends(require_authentication)],
 )
 def get_proc_information(
@@ -402,58 +549,64 @@ def get_proc_information(
         description="Optional character limit applied to the textual response.",
     ),
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> ProcResponse:
     query_path = escape_proc_path(path)
     result = db_client.execute(f"show proc '{query_path}'")
     if not result.success:
-        return {
-            "success": False,
-            "error_message": result.error_message,
-        }
-    return {
-        "success": True,
-        "path": path,
-        "content": result.to_string(limit=limit or DEFAULT_TABLE_OVERVIEW_LIMIT),
-    }
+        return ProcResponse(
+            success=False,
+            path=path,
+            content=None,
+            error_message=result.error_message,
+        )
+    return ProcResponse(
+        success=True,
+        path=path,
+        content=result.to_string(limit=limit or DEFAULT_TABLE_OVERVIEW_LIMIT),
+    )
 
 
 @router.post(
     "/queries/read",
+    response_model=QueryResultResponse,
     dependencies=[Depends(require_authentication)],
 )
 def execute_read_query(
     payload: QueryRequest,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> QueryResultResponse:
     result = db_client.execute(payload.query, db=payload.database)
     return build_query_response(result)
 
 
 @router.post(
     "/queries/write",
+    response_model=QueryResultResponse,
     dependencies=[Depends(require_authentication)],
 )
 def execute_write_query(
     payload: QueryRequest,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> QueryResultResponse:
     result = db_client.execute(payload.query, db=payload.database)
     return build_query_response(result)
 
 
 @router.post(
     "/queries/analyze",
+    response_model=AnalyzeQueryResponse,
     dependencies=[Depends(require_authentication)],
 )
 def analyze_query(
     payload: AnalyzeQueryRequest,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> AnalyzeQueryResponse:
     if not payload.uuid and not payload.sql:
-        return {
-            "success": False,
-            "error_message": "Either 'uuid' or 'sql' must be provided.",
-        }
+        return AnalyzeQueryResponse(
+            success=False,
+            analysis=None,
+            error_message="Either 'uuid' or 'sql' must be provided.",
+        )
 
     if payload.uuid:
         result = db_client.execute(
@@ -465,64 +618,74 @@ def analyze_query(
         )
 
     if not result.success:
-        return {
-            "success": False,
-            "error_message": result.error_message,
-        }
+        return AnalyzeQueryResponse(
+            success=False,
+            analysis=None,
+            error_message=result.error_message,
+        )
 
-    return {
-        "success": True,
-        "analysis": result.to_string(),
-    }
+    return AnalyzeQueryResponse(
+        success=True,
+        analysis=result.to_string(),
+    )
 
 
 @router.post(
     "/queries/perf-collect",
+    response_model=PerfCollectResponse,
     dependencies=[Depends(require_authentication)],
 )
 def collect_perf_data(
     payload: QueryRequest,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> PerfCollectResponse:
     result: PerfAnalysisInput = db_client.collect_perf_analysis_input(
         payload.query, db=payload.database
     )
     error_message = result.get("error_message")
-    return {
-        "success": not error_message,
-        "result": result,
-    }
+    return PerfCollectResponse(
+        success=not error_message,
+        result=result,
+        error_message=error_message,
+    )
 
 
 @router.post(
     "/queries/plot",
+    response_model=PlotQueryResponse,
     dependencies=[Depends(require_authentication)],
 )
 def query_and_plot(
     payload: PlotQueryRequest,
     db_client: DBClient = Depends(get_db_client_dependency),
-) -> Dict[str, Any]:
+) -> PlotQueryResponse:
     try:
         result = db_client.execute(
             payload.query, db=payload.database, return_format="pandas"
         )
         if not result.success:
-            return {
-                "success": False,
-                "error_message": result.error_message,
-            }
+            return PlotQueryResponse(
+                success=False,
+                chart=None,
+                query_result=build_query_response(result),
+                error_message=result.error_message,
+            )
         if result.pandas is None:
-            return {
-                "success": False,
-                "error_message": "Query did not return tabular data.",
-            }
+            return PlotQueryResponse(
+                success=False,
+                chart=None,
+                query_result=build_query_response(result),
+                error_message="Query did not return tabular data.",
+            )
 
         df: pd.DataFrame = result.pandas
         if df.empty:
-            return {
-                "success": False,
-                "error_message": "Query returned no data to plot.",
-            }
+            return PlotQueryResponse(
+                success=False,
+                chart=None,
+                query_result=build_query_response(result),
+                error_message="Query returned no data to plot.",
+            )
 
         validate_plotly_expr(payload.plotly_expr)
         local_vars = {"df": df}
@@ -534,36 +697,33 @@ def query_and_plot(
         if response_format == "plotly_json":
             plot_json = figure.to_plotly_json()
             structured_content = build_query_response(result)
-            structured_content["data"] = plot_json["data"]
-            structured_content["layout"] = plot_json["layout"]
-            structured_content["dataframe_preview"] = preview
-            return {
-                "success": True,
-                "chart": {
-                    "format": "plotly_json",
-                    "data": plot_json["data"],
-                    "layout": plot_json["layout"],
-                },
-                "query_result": structured_content,
-            }
+            structured_content.data = plot_json["data"]
+            structured_content.layout = plot_json["layout"]
+            structured_content.dataframe_preview = preview
+            return PlotQueryResponse(
+                success=True,
+                chart=PlotChartPayload(
+                    format="plotly_json",
+                    data=plot_json["data"],
+                    layout=plot_json["layout"],
+                ),
+                query_result=structured_content,
+            )
 
         img_bytes = figure.to_image(format="png", width=960, height=720)
         image_base64 = base64.b64encode(img_bytes).decode("utf-8")
         structured_content = build_query_response(result)
-        structured_content["dataframe_preview"] = preview
-        return {
-            "success": True,
-            "chart": {
-                "format": "image_base64",
-                "image": image_base64,
-            },
-            "query_result": structured_content,
-        }
+        structured_content.dataframe_preview = preview
+        return PlotQueryResponse(
+            success=True,
+            chart=PlotChartPayload(
+                format="image_base64",
+                image=image_base64,
+            ),
+            query_result=structured_content,
+        )
     except Exception as exc:  # pragma: no cover - dependent on plotly/kaleido runtime
-        return {
-            "success": False,
-            "error_message": str(exc),
-        }
+        return PlotQueryResponse(success=False, chart=None, error_message=str(exc))
 
 
 @router.get(
@@ -595,6 +755,7 @@ def table_overview(
 
 @router.get(
     "/databases/{database}/summary",
+    response_model=DatabaseSummaryResponse,
     dependencies=[Depends(require_authentication)],
 )
 def database_summary(
@@ -610,17 +771,18 @@ def database_summary(
     summary_manager: DatabaseSummaryManager = Depends(
         get_db_summary_manager_dependency
     ),
-) -> Dict[str, Any]:
+) -> DatabaseSummaryResponse:
     summary = summary_manager.get_database_summary(database, limit=limit, refresh=refresh)
     summary_text = summary or ""
     success = not summary_text.lower().startswith("error:")
-    return {
-        "success": success,
-        "database": database,
-        "summary": summary,
-        "limit": limit,
-        "refresh": refresh,
-    }
+    return DatabaseSummaryResponse(
+        success=success,
+        database=database,
+        summary=summary,
+        limit=limit,
+        refresh=refresh,
+        error_message=None if success else summary_text,
+    )
 
 
 app = create_app()
