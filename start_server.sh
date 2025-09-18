@@ -6,12 +6,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$ROOT_DIR"
 
-# Ensure a virtual environment exists for the API server runtime dependencies.
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
+# Ensure we are operating inside the expected Conda environment. The environment name can
+# be overridden by exporting STARROCKS_CONDA_ENV; otherwise we default to "mcp".
+CONDA_ENV_NAME="${STARROCKS_CONDA_ENV:-mcp}"
 
-source .venv/bin/activate
+if [ "${CONDA_DEFAULT_ENV-}" != "$CONDA_ENV_NAME" ]; then
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$CONDA_ENV_NAME"
+  else
+    echo "Conda environment '$CONDA_ENV_NAME' is required but conda was not found in PATH." >&2
+    exit 1
+  fi
+fi
 
 # Keep pip itself up to date, then install the project in editable mode so the
 # `starrocks-api-server` entry point is available.
