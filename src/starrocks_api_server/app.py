@@ -150,9 +150,6 @@ def create_app() -> FastAPI:
     return application
 
 
-app = create_app()
-
-
 def get_db_client_dependency() -> DBClient:
     return get_db_client()
 
@@ -606,6 +603,9 @@ def database_summary(
         "limit": limit,
         "refresh": refresh,
     }
+
+
+app = create_app()
 
 
 __all__ = [
