@@ -30,6 +30,8 @@ from mcp_server_starrocks.db_summary_manager import (
 )
 
 API_TOKEN_ENV = "STARROCKS_API_BEARER_TOKEN"
+PUBLIC_URL_ENV = "STARROCKS_API_PUBLIC_URL"
+DEFAULT_PUBLIC_URL = "http://localhost:8002"
 DEFAULT_TABLE_OVERVIEW_LIMIT = int(os.getenv("STARROCKS_OVERVIEW_LIMIT", "20000"))
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -128,9 +130,24 @@ def validate_plotly_expr(expr: str) -> None:
                 )
 
 
+def resolve_public_server_url() -> str:
+    """Return the externally accessible base URL advertised via OpenAPI."""
+
+    raw_value = os.getenv(PUBLIC_URL_ENV)
+    if raw_value is not None:
+        cleaned = raw_value.strip()
+        if cleaned:
+            # Normalise trailing slashes so GPT Actions sees a stable URL.
+            trimmed = cleaned.rstrip("/")
+            return trimmed or DEFAULT_PUBLIC_URL
+        # Fall back to default when the environment variable only contained whitespace.
+    return DEFAULT_PUBLIC_URL
+
+
 def create_app() -> FastAPI:
     """Create and configure a FastAPI application instance."""
 
+    public_url = resolve_public_server_url()
     application = FastAPI(
         title="StarRocks MCP API Server",
         description=(
@@ -138,6 +155,7 @@ def create_app() -> FastAPI:
             "enabling integrations such as GPT Actions via the generated OpenAPI schema."
         ),
         version="0.1.0",
+        servers=[{"url": public_url}],
     )
 
     application.state.table_overview_cache: Dict[Tuple[str, str], TableOverviewCacheEntry] = {}
