@@ -30,7 +30,7 @@ from mcp_server_starrocks.db_summary_manager import (
 )
 
 API_TOKEN_ENV = "STARROCKS_API_BEARER_TOKEN"
-PUBLIC_SERVER_URL = "https://starrocks-mcp.devicesformula.com/api"
+PUBLIC_SERVER_URL = "https://starrocks-mcp.devicesformula.com"
 DEFAULT_TABLE_OVERVIEW_LIMIT = int(os.getenv("STARROCKS_OVERVIEW_LIMIT", "20000"))
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -444,13 +444,13 @@ def compute_table_overview(
     return overview_payload
 
 
-@router.get("/health", response_model=HealthcheckResponse)
+@router.get("/api/health", response_model=HealthcheckResponse)
 def healthcheck() -> HealthcheckResponse:
     return HealthcheckResponse(status="ok")
 
 
 @router.get(
-    "/databases",
+    "/api/databases",
     response_model=ListDatabasesResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -474,12 +474,12 @@ def list_databases(
 
 
 @router.get(
-    "/databases/{database}/tables",
+    "/api/databases/tables",
     response_model=ListTablesResponse,
     dependencies=[Depends(require_authentication)],
 )
 def list_tables(
-    database: str,
+    database: str = Query(..., description="Database whose tables are requested."),
     db_client: DBClient = Depends(get_db_client_dependency),
 ) -> ListTablesResponse:
     result = db_client.execute(
@@ -503,13 +503,13 @@ def list_tables(
 
 
 @router.get(
-    "/databases/{database}/tables/{table}/schema",
+    "/api/tables/schema",
     response_model=TableSchemaResponse,
     dependencies=[Depends(require_authentication)],
 )
 def get_table_schema(
-    database: str,
-    table: str,
+    database: str = Query(..., description="Database containing the requested table."),
+    table: str = Query(..., description="Table whose schema is requested."),
     format: Optional[str] = Query(
         default="text", description="Return format. Only 'text' is currently supported."
     ),
@@ -538,12 +538,12 @@ def get_table_schema(
 
 
 @router.get(
-    "/proc/{path:path}",
+    "/api/proc",
     response_model=ProcResponse,
     dependencies=[Depends(require_authentication)],
 )
 def get_proc_information(
-    path: str,
+    path: str = Query(..., description="SHOW PROC path to query."),
     limit: Optional[int] = Query(
         default=None,
         description="Optional character limit applied to the textual response.",
@@ -567,7 +567,7 @@ def get_proc_information(
 
 
 @router.post(
-    "/queries/read",
+    "/api/queries/read",
     response_model=QueryResultResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -580,7 +580,7 @@ def execute_read_query(
 
 
 @router.post(
-    "/queries/write",
+    "/api/queries/write",
     response_model=QueryResultResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -593,7 +593,7 @@ def execute_write_query(
 
 
 @router.post(
-    "/queries/analyze",
+    "/api/queries/analyze",
     response_model=AnalyzeQueryResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -631,7 +631,7 @@ def analyze_query(
 
 
 @router.post(
-    "/queries/perf-collect",
+    "/api/queries/perf-collect",
     response_model=PerfCollectResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -651,7 +651,7 @@ def collect_perf_data(
 
 
 @router.post(
-    "/queries/plot",
+    "/api/queries/plot",
     response_model=PlotQueryResponse,
     dependencies=[Depends(require_authentication)],
 )
@@ -727,14 +727,14 @@ def query_and_plot(
 
 
 @router.get(
-    "/databases/{database}/tables/{table}/overview",
+    "/api/tables/overview",
     response_model=TableOverviewResponse,
     dependencies=[Depends(require_authentication)],
 )
 def table_overview(
-    database: str,
-    table: str,
     request: Request,
+    database: str = Query(..., description="Database containing the table to inspect."),
+    table: str = Query(..., description="Table to inspect."),
     refresh: bool = Query(
         default=False,
         description="Set to true to bypass the cached response and fetch fresh data.",
@@ -754,12 +754,12 @@ def table_overview(
 
 
 @router.get(
-    "/databases/{database}/summary",
+    "/api/databases/summary",
     response_model=DatabaseSummaryResponse,
     dependencies=[Depends(require_authentication)],
 )
 def database_summary(
-    database: str,
+    database: str = Query(..., description="Database to summarise."),
     limit: int = Query(
         default=10000,
         description="Character limit applied to the textual summary output.",

@@ -163,46 +163,92 @@ def test_openapi_advertises_devicesformula_host():
     app = create_app()
     schema = app.openapi()
     assert schema["servers"] == [
-        {"url": "https://starrocks-mcp.devicesformula.com/api"}
+        {"url": "https://starrocks-mcp.devicesformula.com"}
     ]
 
 
 def test_health_endpoint(api_client):
     client, _, _ = api_client
-    response = client.get("/health")
+    response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
 def test_authentication_required(api_client):
     client, _, _ = api_client
-    response = client.get("/databases")
+    response = client.get("/api/databases")
     assert response.status_code == 401
     assert response.json()["detail"] == "Missing bearer token."
 
 
 def test_list_databases(api_client):
     client, _, _ = api_client
-    response = client.get("/databases", headers=auth_headers())
+    response = client.get("/api/databases", headers=auth_headers())
     payload = response.json()
     assert response.status_code == 200
     assert payload["success"] is True
     assert payload["databases"] == ["default", "analytics"]
 
 
+def test_list_tables_endpoint(api_client):
+    client, _, _ = api_client
+    response = client.get(
+        "/api/databases/tables",
+        headers=auth_headers(),
+        params={"database": "default"},
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["success"] is True
+    assert payload["database"] == "default"
+    assert payload["tables"] == ["events", "users"]
+
+
+def test_get_table_schema_endpoint(api_client):
+    client, _, _ = api_client
+    response = client.get(
+        "/api/tables/schema",
+        headers=auth_headers(),
+        params={"database": "default", "table": "users"},
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["success"] is True
+    assert payload["database"] == "default"
+    assert payload["table"] == "users"
+    assert "CREATE TABLE users" in payload["schema_sql"]
+
+
+def test_get_proc_information_endpoint(api_client):
+    client, _, _ = api_client
+    response = client.get(
+        "/api/proc",
+        headers=auth_headers(),
+        params={"path": "frontends"},
+    )
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["success"] is True
+    assert payload["path"] == "frontends"
+    assert "status" in payload["content"]
+
+
 def test_table_overview_caching(api_client):
     client, fake_db, _ = api_client
 
+    params = {"database": "default", "table": "users"}
     first = client.get(
-        "/databases/default/tables/users/overview",
+        "/api/tables/overview",
         headers=auth_headers(),
+        params=params,
     )
     assert first.status_code == 200
     assert first.json()["cache"]["hit"] is False
 
     second = client.get(
-        "/databases/default/tables/users/overview",
+        "/api/tables/overview",
         headers=auth_headers(),
+        params=params,
     )
     assert second.status_code == 200
     assert second.json()["cache"]["hit"] is True
@@ -215,7 +261,7 @@ def test_query_plot_json_format(api_client):
     client, fake_db, _ = api_client
 
     response = client.post(
-        "/queries/plot",
+        "/api/queries/plot",
         headers=auth_headers(),
         json={
             "query": "SELECT x, y FROM metrics",
@@ -234,9 +280,9 @@ def test_query_plot_json_format(api_client):
 def test_database_summary_endpoint(api_client):
     client, _, fake_summary = api_client
     response = client.get(
-        "/databases/analytics/summary",
+        "/api/databases/summary",
         headers=auth_headers(),
-        params={"limit": 5000, "refresh": True},
+        params={"database": "analytics", "limit": 5000, "refresh": True},
     )
     payload = response.json()
     assert response.status_code == 200
@@ -248,7 +294,7 @@ def test_database_summary_endpoint(api_client):
 def test_collect_perf_data(api_client):
     client, fake_db, _ = api_client
     response = client.post(
-        "/queries/perf-collect",
+        "/api/queries/perf-collect",
         headers=auth_headers(),
         json={"query": "SELECT * FROM events"},
     )
