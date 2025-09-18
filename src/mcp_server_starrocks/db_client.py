@@ -21,10 +21,20 @@ from typing import Optional, List, Any, Union, Literal, TypedDict, NotRequired
 from dataclasses import dataclass
 import mysql.connector
 from mysql.connector import Error as MySQLError
-import adbc_driver_manager
-import adbc_driver_flightsql.dbapi as flight_sql
-from adbc_driver_manager import Error as adbcError
 import pandas as pd
+
+try:  # pragma: no cover - import availability depends on optional dependency
+    import adbc_driver_manager
+    import adbc_driver_flightsql.dbapi as flight_sql
+    from adbc_driver_manager import Error as adbcError
+except ImportError:  # pragma: no cover - exercised only when Arrow Flight SQL deps missing
+    adbc_driver_manager = None
+    flight_sql = None
+
+    class adbcError(Exception):
+        """Fallback exception type when ADBC drivers are unavailable."""
+
+        pass
 
 
 @dataclass
@@ -143,7 +153,15 @@ class DBClient:
     
     def __init__(self):
         self.enable_dummy_test = bool(os.getenv('STARROCKS_DUMMY_TEST'))
-        self.enable_arrow_flight_sql = bool(os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT'))
+        arrow_port = os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', '').strip()
+        drivers_available = adbc_driver_manager is not None and flight_sql is not None
+        self.enable_arrow_flight_sql = bool(arrow_port) and drivers_available
+        self.arrow_flight_port = arrow_port or None
+        if arrow_port and not drivers_available:
+            print(
+                "Warning: STARROCKS_FE_ARROW_FLIGHT_SQL_PORT is set but Arrow Flight SQL "
+                "drivers are unavailable. Falling back to the MySQL protocol."
+            )
         if os.getenv('STARROCKS_URL'):
             self.connection_params = parse_connection_url(os.getenv('STARROCKS_URL'))
             # Convert port to integer for mysql.connector
@@ -165,7 +183,15 @@ class DBClient:
             'connection_timeout': int(os.getenv('STARROCKS_CONNECTION_TIMEOUT', '10')),
             'connect_timeout': int(os.getenv('STARROCKS_CONNECTION_TIMEOUT', '10')),
         })
-        self.default_database = self.connection_params.get('database')
+        database_value = self.connection_params.get('database')
+        if isinstance(database_value, str):
+            database_value = database_value.strip()
+        if not database_value:
+            self.default_database = None
+            self.connection_params.pop('database', None)
+        else:
+            self.default_database = database_value
+            self.connection_params['database'] = database_value
 
         # MySQL connection pool
         self._connection_pool = None
@@ -213,8 +239,11 @@ class DBClient:
     
     def _create_adbc_connection(self):
         """Create a new ADBC connection."""
+        if not self.arrow_flight_port or flight_sql is None or adbc_driver_manager is None:
+            raise RuntimeError("Arrow Flight SQL support is not available in this environment.")
+
         fe_host = self.connection_params['host']
-        fe_port = os.getenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', '')
+        fe_port = self.arrow_flight_port
         user = self.connection_params['user']
         password = self.connection_params['password']
         

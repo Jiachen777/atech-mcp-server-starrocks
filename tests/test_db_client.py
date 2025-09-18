@@ -45,7 +45,42 @@ class TestDBClient:
         assert db_client.default_database is None
         assert db_client._connection_pool is None
         assert db_client._adbc_connection is None
-    
+
+    def test_blank_default_database_env(self, monkeypatch):
+        """Blank STARROCKS_DB should be treated as no default database."""
+        monkeypatch.setenv('STARROCKS_DB', '')
+        reset_db_connections()
+        client = DBClient()
+
+        assert client.default_database is None
+        assert 'database' not in client.connection_params
+
+        client.reset_connections()
+
+    def test_connection_url_without_database(self, monkeypatch):
+        """A connection URL without database keeps the session unlocked."""
+        monkeypatch.setenv('STARROCKS_URL', 'root:@localhost:9030')
+        reset_db_connections()
+        client = DBClient()
+
+        assert client.default_database is None
+        assert 'database' not in client.connection_params
+
+        client.reset_connections()
+
+    def test_arrow_disabled_when_drivers_missing(self, monkeypatch):
+        """If Arrow drivers are unavailable, fall back to MySQL mode."""
+        monkeypatch.setenv('STARROCKS_FE_ARROW_FLIGHT_SQL_PORT', '9408')
+        monkeypatch.setattr('src.mcp_server_starrocks.db_client.flight_sql', None, raising=False)
+        monkeypatch.setattr('src.mcp_server_starrocks.db_client.adbc_driver_manager', None, raising=False)
+        reset_db_connections()
+        client = DBClient()
+
+        assert client.enable_arrow_flight_sql is False
+        assert client.arrow_flight_port == '9408'
+
+        client.reset_connections()
+
     def test_singleton_pattern(self):
         """Test that get_db_client returns the same instance."""
         client1 = get_db_client()
