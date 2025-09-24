@@ -33,6 +33,7 @@ Major Features and Enhancements
 
 - Major refactor may require configuration updates for some deployment scenarios
 - Connection handling has been restructured (though backwards compatibility is maintained)
+- Removed the `query_and_plotly_chart` visualization tool and its Plotly-based dependencies
 
 ## Version 0.1.4
 
