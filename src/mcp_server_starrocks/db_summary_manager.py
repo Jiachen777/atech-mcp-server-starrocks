@@ -243,7 +243,7 @@ class DatabaseSummaryManager:
         """Generate comprehensive database summary with intelligent prioritization"""
         if not database:
             return "Error: Database name is required"
-        
+
         logger.info(f"Generating database summary for {database}, limit={limit}, refresh={refresh}")
         
         # Sync table list
@@ -286,7 +286,55 @@ class DatabaseSummaryManager:
         
         # Generate summary output
         return self._format_database_summary(database, tables_info, limit)
-    
+
+    def get_all_database_summaries(self, limit: int = 10000, refresh: bool = False) -> str:
+        """Generate summaries for all available databases."""
+        logger.info(f"Generating database summaries for all databases, limit={limit}, refresh={refresh}")
+
+        try:
+            databases_result = self.db_client.execute("SHOW DATABASES")
+        except Exception as e:
+            logger.error(f"Failed to retrieve database list: {e}")
+            return f"Error: Failed to retrieve database list: {e}"
+
+        if not databases_result.success:
+            logger.error(f"Failed to retrieve database list: {databases_result.error_message}")
+            error_message = databases_result.error_message or "Unknown error"
+            return f"Error: Failed to retrieve database list: {error_message}"
+
+        if not databases_result.rows:
+            logger.warning("SHOW DATABASES returned no databases")
+            return "No databases found."
+
+        summaries: List[str] = []
+
+        for row in databases_result.rows:
+            if not row:
+                continue
+
+            db_name = row[0]
+            if not db_name:
+                continue
+
+            try:
+                summary = self.get_database_summary(db_name, limit=limit, refresh=refresh)
+            except Exception as e:
+                logger.error(f"Error generating summary for database {db_name}: {e}")
+                summary = f"Error generating summary for database '{db_name}': {e}"
+
+            summaries.append(summary)
+
+        if not summaries:
+            logger.warning("No valid databases found while generating summaries")
+            return "No databases found."
+
+        lines = ["=== All Databases Summary ==="]
+        for summary in summaries:
+            lines.append(summary)
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
     def _format_database_summary(self, database: str, tables_info: List[TableInfo], limit: int) -> str:
         """Format database summary with intelligent truncation"""
         lines = []
