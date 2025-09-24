@@ -14,7 +14,6 @@ The StarRocks MCP Server acts as a bridge between AI assistants and StarRocks da
 - **Database Exploration:** List databases and tables, retrieve table schemas (`starrocks://` resources).
 - **System Information:** Access internal StarRocks metrics and states via the `proc://` resource path.
 - **Detailed Overviews:** Get comprehensive summaries of tables (`table_overview`) or entire databases (`db_overview`), including column definitions, row counts, and sample data.
-- **Data Visualization:** Execute a query and generate a Plotly chart directly from the results (`query_and_plotly_chart`).
 - **Intelligent Caching:** Table and database overviews are cached in memory to speed up repeated requests. Cache can be bypassed when needed.
 - **Flexible Configuration:** Set connection details and behavior via environment variables.
 
@@ -239,21 +238,6 @@ You can configure StarRocks connection using either individual environment varia
     }
     ```
   - **Output:** Text content containing the query analysis results. Uses `ANALYZE PROFILE FROM` if uuid is provided, otherwise uses `EXPLAIN ANALYZE` if sql is provided.
-
-- `query_and_plotly_chart`
-
-  - **Description:** Executes a SQL query, loads the results into a Pandas DataFrame, and generates a Plotly chart using a provided Python expression. Designed for visualization in supporting UIs.
-  - **Input:**
-    ```json
-    {
-      "query": "SQL query to fetch data",
-      "plotly_expr": "Python expression string using 'px' (Plotly Express) and 'df' (DataFrame). Example: 'px.scatter(df, x=\"col1\", y=\"col2\")'",
-      "db": "database name (optional, uses default database if not specified)"
-    }
-    ```
-  - **Output:** A list containing:
-    1.  `TextContent`: A text representation of the DataFrame and a note that the chart is for UI display.
-    2.  `ImageContent`: The generated Plotly chart encoded as a base64 PNG image (`image/png`). Returns text error message on failure or if the query yields no data.
 
 - `table_overview`
 

@@ -56,9 +56,6 @@ Connection management uses a global singleton pattern with automatic reconnectio
    - `table_overview`: Get table schema, row count, and sample data (cached)
    - `db_overview`: Get overview of all tables in a database (uses table cache)
    
-3. **Visualization Tool**:
-   - `query_and_plotly_chart`: Execute query and generate Plotly charts from results
-
 ### Resource Endpoints
 
 - `starrocks:///databases`: List all databases
@@ -91,8 +88,6 @@ Environment variables for database connection:
 
 ### Security
 - SQL injection prevention through parameterized queries and backtick escaping
-- Plotly expressions are validated using AST parsing to prevent code injection
-- Limited `eval()` usage with restricted scope for chart generation
 
 ### Async Patterns
 - Tools are defined as async functions even though database operations are synchronous
