@@ -354,12 +354,14 @@ def db_summary(
 ) -> str:
     try:
         db_name = db if db else db_client.default_database
-        logger.info(f"Getting database summary for: {db_name}, limit={limit}, refresh={refresh}")
-        
         if not db_name:
-            logger.error("Database summary called without database name")
-            return "Error: Database name not provided and no default database is set."
-        
+            logger.info("No database provided. Generating summaries for all databases.")
+            summary = db_summary_manager.get_all_database_summaries(limit=limit, refresh=refresh)
+            logger.info("Database summary completed for all databases")
+            return summary
+
+        logger.info(f"Getting database summary for: {db_name}, limit={limit}, refresh={refresh}")
+
         # Use the database summary manager
         summary = db_summary_manager.get_database_summary(db_name, limit=limit, refresh=refresh)
         logger.info(f"Database summary completed for {db_name}")
